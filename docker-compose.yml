@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  agent:
+    build: .
+    container_name: travel_agent
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: travel_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  demo:
+    build: .
+    container_name: travel_demo
+    command: python demo.py
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    depends_on:
+      - agent
+    restart: unless-stopped
