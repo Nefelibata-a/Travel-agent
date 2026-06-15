@@ -1,28 +1,48 @@
 """
-FastAPI application for SmartTrip Agent.
+FastAPI application for SmartTrip Agent — MCP edition.
 
 Endpoints:
   POST /plan     — start a trip planning session
   GET  /plan/{session_id} — get the itinerary for a session
   GET  /history/{session_id} — get conversation history
   DELETE /session/{session_id} — clear session
-  GET  /tools    — list available tools
-  GET  /health   — health check
+  GET  /tools    — list available MCP tools
+  GET  /health   — health check (includes MCP server status)
 """
 
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.graph import agent_graph
+from agent.mcp_client import get_mcp_client, shutdown_mcp_client, discover_mcp_tools
 from memory.manager import MemoryManager
-from tools.registry import get_all_tools
 from langchain_core.messages import HumanMessage
 from loguru import logger
 
-app = FastAPI(title="SmartTrip AI Travel Planner", version="0.1.0")
+
+# ---- MCP lifecycle: start on app startup, stop on shutdown ----
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start MCP server on app startup, clean up on shutdown."""
+    logger.info("[lifespan] Starting MCP client...")
+    client = get_mcp_client()
+    logger.info(f"[lifespan] MCP server running: {client.is_running()}")
+    yield
+    logger.info("[lifespan] Shutting down MCP client...")
+    shutdown_mcp_client()
+
+
+app = FastAPI(
+    title="SmartTrip AI Travel Planner (MCP Edition)",
+    version="0.2.0",
+    lifespan=lifespan,
+)
 _memory = MemoryManager()
 
 
@@ -46,7 +66,7 @@ class PlanResponse(BaseModel):
 
 @app.post("/plan", response_model=PlanResponse)
 async def plan_trip(req: PlanRequest):
-    """Plan a complete trip. The Agent will call tools sequentially."""
+    """Plan a complete trip. The Agent calls tools through MCP protocol."""
     if not req.origin:
         raise HTTPException(status_code=400, detail="Please provide departure city (origin)")
 
@@ -76,7 +96,7 @@ async def plan_trip(req: PlanRequest):
 
     answer = final["messages"][-1].content
 
-    # Extract tool names called
+    # Extract tool names called (from ToolMessage)
     tool_names = [
         m.name for m in final["messages"]
         if hasattr(m, "name") and m.name
@@ -121,13 +141,23 @@ async def clear_session(session_id: str):
 
 @app.get("/tools")
 async def list_tools():
-    tools = get_all_tools()
-    return {
-        "count": len(tools),
-        "tools": [{"name": t.name, "description": t.description} for t in tools],
-    }
+    """List all tools available through MCP server."""
+    try:
+        tools = discover_mcp_tools()
+        return {
+            "count": len(tools),
+            "protocol": "MCP",
+            "tools": [{"name": t.name, "description": t.description} for t in tools],
+        }
+    except Exception as e:
+        return {"count": 0, "protocol": "MCP", "error": str(e)}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    client = get_mcp_client()
+    return {
+        "status": "ok",
+        "mcp_server": "running" if client.is_running() else "stopped",
+        "version": "0.2.0 (MCP Edition)",
+    }
