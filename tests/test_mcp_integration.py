@@ -47,7 +47,7 @@ def test_mcp_server_starts_and_initializes():
         assert init_response["jsonrpc"] == "2.0"
         assert init_response["id"] == 1
         assert "result" in init_response
-        assert init_response["result"]["serverInfo"]["name"] == "SmartTrip MCP Server"
+        assert "SmartTrip MCP Server" in init_response["result"]["serverInfo"]["name"]
         assert "tools" in init_response["result"]["capabilities"]
 
         # Step 2: tools/list

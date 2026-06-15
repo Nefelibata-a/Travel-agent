@@ -15,6 +15,7 @@ The MCP server wraps them as MCP tools; the agent calls them through MCP protoco
 import subprocess
 import json
 import os
+import asyncio
 import httpx
 from pydantic import BaseModel, Field
 from loguru import logger
@@ -50,7 +51,7 @@ class WeatherCheckInput(BaseModel):
 
 class BudgetCalculatorInput(BaseModel):
     code: str = Field(..., description="Python code that defines a dict 'cost' and prints breakdown")
-    timeout_seconds: int = Field(default=10, ge=1, le=30)
+    timeout_seconds: int = Field(default=30, ge=1, le=30)
 
 
 # ============================================================================
@@ -61,6 +62,7 @@ _SERPAPI_URL = "https://serpapi.com/search"
 
 
 def _serpapi_search(query: str, num: int = 5) -> list[dict]:
+    """同步版本 — 保留向后兼容。新代码使用 _serpapi_search_async。"""
     api_key = os.getenv("SERPAPI_API_KEY", "")
     if not api_key:
         return [{"error": "SERPAPI_API_KEY not configured"}]
@@ -83,6 +85,38 @@ def _serpapi_search(query: str, num: int = 5) -> list[dict]:
         ]
     except Exception as e:
         logger.error(f"[serpapi] {e}")
+        return [{"error": str(e)}]
+
+
+async def _serpapi_search_async(query: str, num: int = 5) -> list[dict]:
+    """异步版本 — MCP Server 使用此版本实现并发 HTTP 请求。
+    
+    与同步版的关键区别：
+    - httpx.AsyncClient + await → 等待响应时不阻塞事件循环
+    - 4 个并发调用时，总耗时 = max(4个), 而非 sum(4个)
+    """
+    api_key = os.getenv("SERPAPI_API_KEY", "")
+    if not api_key:
+        return [{"error": "SERPAPI_API_KEY not configured"}]
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                _SERPAPI_URL,
+                params={
+                    "q": query,
+                    "engine": "bing",
+                    "api_key": api_key,
+                    "num": num,
+                },
+            )
+            data = resp.json()
+            results = data.get("organic_results", [])[:num]
+            return [
+                {"title": r.get("title", ""), "snippet": r.get("snippet", ""), "url": r.get("link", "")}
+                for r in results
+            ]
+    except Exception as e:
+        logger.error(f"[serpapi async] {e}")
         return [{"error": str(e)}]
 
 
@@ -155,33 +189,103 @@ def weather_check(city: str, date: str = "") -> str:
     )
 
 
-def budget_calculator(code: str, timeout_seconds: int = 10) -> str:
+def budget_calculator(code: str, timeout_seconds: int = 30) -> str:
     """
     Execute Python code in a sandbox to calculate trip budget.
-    The code MUST define a dict 'cost' and print a breakdown.
-    Example:
-      cost = {"flight": 1200, "hotel": 1500, "food": 800, "total": 3500}
-      for k, v in cost.items():
-          print(f"{k}: {v} CNY")
+    Uses exec() in a thread instead of subprocess (Windows startup is too slow).
     """
-    try:
-        result = subprocess.run(
-            ["python", "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        output = {
-            "stdout": result.stdout[:2000],
-            "stderr": result.stderr[:500],
-            "returncode": result.returncode,
-        }
-        logger.info(f"[budget_calculator] returncode={result.returncode}")
-        return json.dumps(output)
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": f"Calculation timed out after {timeout_seconds}s"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    import io, threading
+
+    logger.info(f"[budget_calculator] code_len={len(code)}")
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    result = {"rc": 0, "exc": None}
+
+    def _run():
+        try:
+            with __import__("contextlib").redirect_stdout(out_buf), \
+                 __import__("contextlib").redirect_stderr(err_buf):
+                exec(code, {"__builtins__": __builtins__}, {})
+        except Exception as e:
+            result["rc"] = 1
+            result["exc"] = str(e)
+            print(str(e), file=err_buf)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+
+    if t.is_alive():
+        preview = code[:300].replace("\n", " ")
+        return json.dumps({
+            "error": f"Calculation timed out after {timeout_seconds}s",
+            "code_preview": f"{preview}...",
+            "code_len": len(code),
+        })
+
+    output = {
+        "stdout": out_buf.getvalue()[:2000],
+        "stderr": err_buf.getvalue()[:500],
+        "returncode": result["rc"],
+    }
+    if result["exc"]:
+        output["exception"] = result["exc"]
+    return json.dumps(output)
+
+
+# ============================================================================
+# Async versions — used by MCP Server for concurrent execution
+# ============================================================================
+
+async def flight_search_async(origin: str, destination: str, date: str) -> str:
+    query = f"{origin} to {destination} flight {date} price"
+    logger.info(f"[flight_search] {query}")
+    results = await _serpapi_search_async(query, num=5)
+    return json.dumps(
+        {"query": f"{origin} -> {destination} on {date}", "flights": results},
+        ensure_ascii=False,
+    )
+
+
+async def hotel_search_async(city: str, check_in: str, check_out: str, max_price_per_night: int = 500) -> str:
+    query = f"{city} hotel {check_in} to {check_out} under {max_price_per_night} CNY per night"
+    logger.info(f"[hotel_search] {query}")
+    results = await _serpapi_search_async(query, num=5)
+    return json.dumps(
+        {"city": city, "dates": f"{check_in} ~ {check_out}",
+         "max_price_per_night": max_price_per_night, "hotels": results},
+        ensure_ascii=False,
+    )
+
+
+async def attraction_search_async(city: str, category: str = "all", count: int = 5) -> str:
+    cat_map = {
+        "attractions": f"{city} top attractions must visit",
+        "food": f"{city} best restaurants local food",
+        "shopping": f"{city} shopping areas markets",
+        "all": f"{city} travel guide attractions food itinerary",
+    }
+    query = cat_map.get(category, cat_map["all"])
+    logger.info(f"[attraction_search] {query}")
+    results = await _serpapi_search_async(query, num=count)
+    return json.dumps(
+        {"city": city, "category": category, "results": results}, ensure_ascii=False
+    )
+
+
+async def weather_check_async(city: str, date: str = "") -> str:
+    query = f"{city} weather forecast {date}" if date else f"{city} weather today"
+    logger.info(f"[weather_check] {query}")
+    results = await _serpapi_search_async(query, num=3)
+    return json.dumps(
+        {"city": city, "date": date or "current", "weather": results}, ensure_ascii=False
+    )
+
+
+async def budget_calculator_async(code: str, timeout_seconds: int = 30) -> str:
+    """budget_calculator 无 I/O，直接用同步版。"""
+    return budget_calculator(code, timeout_seconds)
 
 
 # ============================================================================
@@ -201,7 +305,7 @@ TOOL_REGISTRY = [
             },
             "required": ["origin", "destination", "date"],
         },
-        "function": flight_search,
+        "function": flight_search_async,  # MCP Server 使用异步版
     },
     {
         "name": "hotel_search",
@@ -220,7 +324,7 @@ TOOL_REGISTRY = [
             },
             "required": ["city", "check_in", "check_out"],
         },
-        "function": hotel_search,
+        "function": hotel_search_async,
     },
     {
         "name": "attraction_search",
@@ -244,7 +348,7 @@ TOOL_REGISTRY = [
             },
             "required": ["city"],
         },
-        "function": attraction_search,
+        "function": attraction_search_async,
     },
     {
         "name": "weather_check",
@@ -261,7 +365,7 @@ TOOL_REGISTRY = [
             },
             "required": ["city"],
         },
-        "function": weather_check,
+        "function": weather_check_async,
     },
     {
         "name": "budget_calculator",
@@ -276,14 +380,14 @@ TOOL_REGISTRY = [
                 "timeout_seconds": {
                     "type": "integer",
                     "description": "Execution timeout (1-30 seconds)",
-                    "default": 10,
+                    "default": 30,
                     "minimum": 1,
                     "maximum": 30,
                 },
             },
             "required": ["code"],
         },
-        "function": budget_calculator,
+        "function": budget_calculator_async,
     },
 ]
 
